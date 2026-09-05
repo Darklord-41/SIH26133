@@ -1,0 +1,214 @@
+// Rural Health Backend — Prisma Schema
+// MSInS Problem Statement 26133 — Offline-first care access for rural Maharashtra
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------------------
+
+enum FacilityType {
+  SUBCENTRE       // Sub Health Centre (SC) - ASHA/ANM level
+  PHC             // Primary Health Centre
+  CHC             // Community Health Centre
+  RURAL_HOSPITAL
+  DISTRICT_HOSPITAL
+}
+
+enum RiskLevel {
+  LOW
+  MODERATE
+  HIGH
+  CRITICAL
+}
+
+enum ReferralStatus {
+  PENDING
+  ACCEPTED
+  IN_TRANSIT
+  COMPLETED
+  REJECTED
+}
+
+enum SyncEventType {
+  PATIENT_CREATE
+  PATIENT_TRIAGE
+  MEDICINE_DISPENSE
+  REFERRAL_CREATE
+  ABHA_LINK
+}
+
+enum SyncEventStatus {
+  SUCCESS
+  FAILED
+  SKIPPED_DUPLICATE
+}
+
+// ---------------------------------------------------------------------------
+// FACILITY + INVENTORY (Resource-aware referral routing & auto-indenting)
+// ---------------------------------------------------------------------------
+
+model Facility {
+  id            String       @id @default(cuid())
+  facilityCode  String       @unique // e.g. "PHC_SHIRUR"
+  name          String
+  type          FacilityType
+  district      String
+  taluka        String
+  village       String?
+  latitude      Float
+  longitude     Float
+
+  // Resource-availability flags used by the referral router
+  xrayStatus       Boolean @default(false)
+  icuAvailable     Boolean @default(false)
+  bedsTotal        Int     @default(0)
+  bedsAvailable    Int     @default(0)
+  hasSpecialist    Boolean @default(false)
+  specialistTypes  String[] @default([]) // e.g. ["ORTHO", "GYNAC"]
+
+  contactNumber String?
+  isActive      Boolean  @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  inventory          Inventory[]
+  patients           Patient[]
+  triageRecords      Triage[]
+  referralsAsSource  Referral[] @relation("SourceFacility")
+  referralsAsDest    Referral[] @relation("DestFacility")
+
+  @@index([district, taluka])
+  @@index([type])
+}
+
+model Inventory {
+  id               String   @id @default(cuid())
+  facilityId       String
+  facility         Facility @relation(fields: [facilityId], references: [id], onDelete: Cascade)
+
+  medicineName     String
+  medicineCode     String?
+  unit             String   @default("units") // strips, vials, tablets, ml
+  currentStock     Int      @default(0)
+  minimumThreshold Int      @default(10)
+  maximumCapacity  Int      @default(500)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([facilityId, medicineName]) // one row per medicine per facility
+  @@index([currentStock])
+}
+
+// ---------------------------------------------------------------------------
+// PATIENT + TRIAGE + ABHA (Longitudinal interoperable records)
+// ---------------------------------------------------------------------------
+
+model Patient {
+  id          String   @id @default(cuid())
+  name        String
+  age         Int?
+  gender      String?
+  phone       String?
+  abhaId      String?  @unique // Ayushman Bharat Health Account (mocked)
+
+  facilityId  String
+  facility    Facility @relation(fields: [facilityId], references: [id])
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  triageRecords Triage[]
+  referrals     Referral[]
+
+  @@index([phone])
+}
+
+model Triage {
+  id            String    @id @default(cuid())
+  patientId     String
+  patient       Patient   @relation(fields: [patientId], references: [id])
+  facilityId    String
+  facility      Facility  @relation(fields: [facilityId], references: [id])
+
+  symptoms      String[]  @default([])
+  vitals        Json?     // { bp, spo2, temp, pulse } captured offline
+  riskLevel     RiskLevel @default(LOW)
+  notes         String?
+
+  recordedBy    String?   // ASHA/ANM worker ID/device ID
+  recordedAt    DateTime  // client-side timestamp (may be offline-delayed)
+  createdAt     DateTime  @default(now())
+
+  @@index([riskLevel])
+  @@index([recordedAt])
+}
+
+// ---------------------------------------------------------------------------
+// REFERRAL (Resource-aware routing)
+// ---------------------------------------------------------------------------
+
+model Referral {
+  id                 String         @id @default(cuid())
+  patientId          String
+  patient            Patient        @relation(fields: [patientId], references: [id])
+
+  sourceFacilityId   String
+  sourceFacility     Facility       @relation("SourceFacility", fields: [sourceFacilityId], references: [id])
+
+  destFacilityId     String?
+  destFacility       Facility?      @relation("DestFacility", fields: [destFacilityId], references: [id])
+
+  reqService         String         // e.g. "XRAY", "ICU", "GYNAC"
+  status             ReferralStatus @default(PENDING)
+  notes              String?
+
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// SYNC EVENT LOG (Idempotency + audit trail for the Store-and-Forward engine)
+// ---------------------------------------------------------------------------
+
+model SyncEvent {
+  id            String          @id @default(cuid())
+  clientEventId String          @unique // UUID generated on-device at capture time — idempotency key
+  deviceId      String
+  type          SyncEventType
+  payload       Json            // raw event body as received from the offline client
+  status        SyncEventStatus
+  errorMessage  String?
+
+  clientCreatedAt DateTime      // when the ASHA app captured the event offline
+  processedAt     DateTime      @default(now())
+
+  @@index([deviceId])
+  @@index([type])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------------------
+// SMS FALLBACK (Emergency 2G bypass via Twilio)
+// ---------------------------------------------------------------------------
+
+model SmsTelemetry {
+  id          String   @id @default(cuid())
+  fromNumber  String
+  rawPayload  String   // pipe-separated string, e.g. "EMG|911234567890|160/105|94"
+  parsedType  String?
+  parsedData  Json?
+  facilityId  String?
+  createdAt   DateTime @default(now())
+}
