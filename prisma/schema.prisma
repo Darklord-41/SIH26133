@@ -51,6 +51,19 @@ enum SyncEventStatus {
   SKIPPED_DUPLICATE
 }
 
+enum UserRole {
+  CITIZEN
+  ASHA_ANM
+  HOSPITAL_STAFF
+  DISTRICT_ADMIN
+}
+
+enum VerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 // ---------------------------------------------------------------------------
 // FACILITY + INVENTORY (Resource-aware referral routing & auto-indenting)
 // ---------------------------------------------------------------------------
@@ -85,6 +98,10 @@ model Facility {
   triageRecords      Triage[]
   referralsAsSource  Referral[] @relation("SourceFacility")
   referralsAsDest    Referral[] @relation("DestFacility")
+  users              User[]
+  appointments       Appointment[]
+  emergencyAlerts      EmergencySos[]
+  feedbacks            Feedback[]
 
   @@index([district, taluka])
   @@index([type])
@@ -115,20 +132,24 @@ model Inventory {
 
 model Patient {
   id          String   @id @default(cuid())
+  userId      String?  @unique
+  user        User?    @relation(fields: [userId], references: [id])
   name        String
   age         Int?
   gender      String?
   phone       String?
+  village     String?
   abhaId      String?  @unique // Ayushman Bharat Health Account (mocked)
 
-  facilityId  String
-  facility    Facility @relation(fields: [facilityId], references: [id])
+  facilityId  String?
+  facility    Facility? @relation(fields: [facilityId], references: [id])
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   triageRecords Triage[]
   referrals     Referral[]
+  appointments  Appointment[]
 
   @@index([phone])
 }
@@ -212,3 +233,134 @@ model SmsTelemetry {
   facilityId  String?
   createdAt   DateTime @default(now())
 }
+
+// ---------------------------------------------------------------------------
+// AUTH & USERS (Role-based access, OTP, Email/Password, ABHA & Admin Verification)
+// ---------------------------------------------------------------------------
+
+model User {
+  id                   String             @id @default(cuid())
+  role                 UserRole           @default(CITIZEN)
+  name                 String?
+  phone                String?            @unique
+  email                String?            @unique
+  passwordHash         String?
+  facilityId           String?
+  facility             Facility?          @relation(fields: [facilityId], references: [id])
+  verificationStatus   VerificationStatus @default(APPROVED) // Staff/Admin starts PENDING; Citizen/ASHA starts APPROVED
+  govtIdType           String?            // e.g. "GOVT_STAFF_ID", "MEDICAL_COUNCIL_ID", "AADHAAR"
+  govtIdNumber         String?
+  verifiedBy           String?            // Admin user ID who approved
+  verifiedAt           DateTime?
+  abhaId               String?            @unique
+  abhaVerified         Boolean            @default(false)
+  abhaLinkedAt         DateTime?
+  refreshToken         String?
+  resetPasswordToken   String?
+  resetPasswordExpires DateTime?
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+
+  patient              Patient?
+  appointments         Appointment[]
+  emergencyAlerts      EmergencySos[]
+  sentMessages         ChatMessage[]      @relation("SentMessages")
+  receivedMessages     ChatMessage[]      @relation("ReceivedMessages")
+  feedbacks            Feedback[]
+
+  @@index([phone])
+  @@index([email])
+  @@index([role])
+  @@index([verificationStatus])
+}
+
+model OtpVerification {
+  id        String   @id @default(cuid())
+  phone     String
+  otp       String
+  purpose   String   @default("LOGIN") // LOGIN, REGISTER, ABHA_LINK
+  expiresAt DateTime
+  isUsed    Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([phone, purpose])
+}
+
+// ---------------------------------------------------------------------------
+// CITIZEN / PATIENT APP MODELS (Appointments, SOS, Chat, Feedback)
+// ---------------------------------------------------------------------------
+
+model Appointment {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  patientId   String?
+  patient     Patient? @relation(fields: [patientId], references: [id])
+  facilityId  String
+  facility    Facility @relation(fields: [facilityId], references: [id])
+
+  type        String   @default("IN_PERSON") // IN_PERSON or TELECONSULTATION
+  scheduledAt DateTime
+  status      String   @default("REQUESTED") // REQUESTED, CONFIRMED, COMPLETED, CANCELLED
+  reason      String?
+  notes       String?
+  meetingLink String?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  feedback    Feedback[]
+
+  @@index([userId])
+  @@index([facilityId])
+  @@index([status])
+}
+
+model EmergencySos {
+  id          String   @id @default(cuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id])
+  phone       String
+  latitude    Float?
+  longitude   Float?
+  vitalBp     String?
+  vitalSpo2   Int?
+  status      String   @default("ACTIVE") // ACTIVE, DISPATCHED, RESOLVED
+  channel     String   @default("APP") // APP or SMS
+  facilityId  String?
+  facility    Facility? @relation(fields: [facilityId], references: [id])
+  createdAt   DateTime @default(now())
+
+  @@index([phone])
+  @@index([status])
+}
+
+model ChatMessage {
+  id         String   @id @default(cuid())
+  senderId   String
+  sender     User     @relation("SentMessages", fields: [senderId], references: [id])
+  receiverId String
+  receiver   User     @relation("ReceivedMessages", fields: [receiverId], references: [id])
+  message    String
+  isRead     Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  @@index([senderId, receiverId])
+}
+
+model Feedback {
+  id            String       @id @default(cuid())
+  userId        String
+  user          User         @relation(fields: [userId], references: [id])
+  facilityId    String?
+  facility      Facility?    @relation(fields: [facilityId], references: [id])
+  appointmentId String?
+  appointment   Appointment? @relation(fields: [appointmentId], references: [id])
+  rating        Int          // 1 to 5 stars
+  comment       String?
+  createdAt     DateTime     @default(now())
+
+  @@index([facilityId])
+  @@index([rating])
+}
+
